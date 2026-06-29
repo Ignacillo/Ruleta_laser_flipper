@@ -58,7 +58,7 @@ static void render_callback(Canvas* canvas, void* context) {
     // --- PANTALLA DE CONFIGURACIÓN ---
     if(ctx->state == StateConfig) {
         canvas_set_font(canvas, FontPrimary);
-        canvas_draw_str(canvas, 2, 12, "Configuración Motor");
+        canvas_draw_str(canvas, 2, 12, "Configuracion Motor");
 
         canvas_set_font(canvas, FontSecondary);
 
