@@ -1,3 +1,5 @@
+/*Sistema para avanzar la ruleta de placas laser mediante pulsos al PAP
+
 #include <furi.h>
 #include <furi_hal_gpio.h>
 #include <furi_hal_light.h>
