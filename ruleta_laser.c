@@ -1,4 +1,4 @@
-/Sistema para avanzar la ruleta de placas laser mediante pulsos al PAP con Menú Interactivo/
+/* Sistema para avanzar la ruleta de placas laser mediante pulsos al PAP con Menú Interactivo */
 
 #include <furi.h>
 #include <furi_hal_gpio.h>
@@ -44,7 +44,7 @@ typedef struct {
     // --- VARIABLES DINÁMICAS (Configurables) ---
     uint32_t motor_pulse_count; // Número de pulsos que se envían en cada sentido
     uint32_t motor_pulse_period_ms; // Tiempo entre ciclos completos de ejecución
-    uint32_t motor_pulse_width_ms; // Ancho de cada pulso en milisegundos
+    uint32_t motor_pulse_width_us; // Ancho de cada pulso en microsegundos
     uint32_t total_repetitions; // Número total de repeticiones del ciclo completo
     uint32_t repetitions_remaining; // Repeticiones que quedan por ejecutar
 
@@ -132,9 +132,9 @@ static void render_callback(Canvas* canvas, void* context) {
                 snprintf(
                     buf,
                     sizeof(buf),
-                    "%s Int. Pulso: %lu ms",
+                    "%s Int. Pulso: %lu us",
                     (ctx->selected_option == MenuPulsosPeriod) ? ">" : " ",
-                    ctx->motor_pulse_width_ms);
+                    ctx->motor_pulse_width_us);
                 break;
             case MenuPulsosWidth:
                 snprintf(
@@ -292,8 +292,7 @@ int32_t ruleta_laser_app(void* p) {
         .state = StateConfig, // Arranca en el menú de configuración
         .current_pulse = 0,
         .motor_pulse_count = 10, // Por defecto 10 pulsos
-        .motor_pulse_width_ms =
-            50, // Por defecto 50ms en alto y 50ms en bajo (anteriormente 50000us)
+        .motor_pulse_width_us = 5000, // Por defecto 5000us (5ms) por pulso
         .motor_pulse_period_ms = 3000, // Por defecto 3 segundos entre grupos
         .total_repetitions = 3, // Por defecto 3 repeticiones
         .repetitions_remaining = 0,
@@ -376,7 +375,7 @@ int32_t ruleta_laser_app(void* p) {
                         if(context.selected_option == MenuPulsosCount)
                             context.motor_pulse_count += 1;
                         else if(context.selected_option == MenuPulsosPeriod)
-                            context.motor_pulse_width_ms += 5;
+                            context.motor_pulse_width_us += 100;
                         else if(context.selected_option == MenuPulsosWidth)
                             context.motor_pulse_period_ms += 250;
                         else if(context.selected_option == MenuRepetitions &&
@@ -389,8 +388,8 @@ int32_t ruleta_laser_app(void* p) {
                             context.motor_pulse_count -= 1;
                         else if(
                             context.selected_option == MenuPulsosPeriod &&
-                            context.motor_pulse_width_ms > 5)
-                            context.motor_pulse_width_ms -= 5;
+                            context.motor_pulse_width_us > 100)
+                            context.motor_pulse_width_us -= 100;
                         else if(
                             context.selected_option == MenuPulsosWidth &&
                             context.motor_pulse_period_ms > 250)
@@ -470,12 +469,12 @@ int32_t ruleta_laser_app(void* p) {
                         // 1. Pulso Alto: activa la salida para generar un pulso de trabajo.
                         furi_hal_gpio_write(context.pin, true);
                         furi_hal_light_set(LightRed, 255);
-                        furi_delay_ms(context.motor_pulse_width_ms);
+                        furi_delay_us(context.motor_pulse_width_us);
 
                         // 2. Pulso Bajo: desactiva la salida para cerrar el pulso.
                         furi_hal_gpio_write(context.pin, false);
                         furi_hal_light_set(LightRed, 0);
-                        furi_delay_ms(context.motor_pulse_width_ms);
+                        furi_delay_us(context.motor_pulse_width_us);
                     }
                 }
 
