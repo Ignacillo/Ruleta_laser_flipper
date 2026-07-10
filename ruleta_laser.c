@@ -44,7 +44,8 @@ typedef struct {
     // --- VARIABLES DINÁMICAS (Configurables) ---
     uint32_t motor_pulse_count; // Número de pulsos que se envían en cada sentido
     uint32_t motor_pulse_period_ms; // Tiempo entre ciclos completos de ejecución
-    uint32_t motor_pulse_width_us; // Ancho de cada pulso en microsegundos
+    uint32_t motor_pulse_width_us; // Ancho de cada pulso en microsegundos (valor que interpreta el driver)
+    uint32_t motor_pulse_interval_us; // Tiempo entre el fin de un pulso y el inicio del siguiente
     uint32_t total_repetitions; // Número total de repeticiones del ciclo completo
     uint32_t repetitions_remaining; // Repeticiones que quedan por ejecutar
 
@@ -76,10 +77,10 @@ static const char* const help_lines[] = {
     "cancela ejecucion",
     "Pulsos: cantidad de ",
     "pulsos por grupo",
-    "Int. Pulso: ancho", 
-    "de cada pulso",
-    "Int. Grupo: tiempo ",
-    "entre grupos",
+    "Ancho Pulso: duracion",
+    "del pulso activo",
+    "Int. Pulsos: tiempo ",
+    "entre pulsos",
     "Pin: PA7 (GPIOA7)",
     "para el motor",
     "El pin se activa y",
@@ -132,7 +133,7 @@ static void render_callback(Canvas* canvas, void* context) {
                 snprintf(
                     buf,
                     sizeof(buf),
-                    "%s Int. Pulso: %lu us",
+                    "%s Ancho Pulso: %lu us",
                     (ctx->selected_option == MenuPulsosPeriod) ? ">" : " ",
                     ctx->motor_pulse_width_us);
                 break;
@@ -140,9 +141,9 @@ static void render_callback(Canvas* canvas, void* context) {
                 snprintf(
                     buf,
                     sizeof(buf),
-                    "%s Int. Grupo: %lu ms",
+                    "%s Int. Pulsos: %lu us",
                     (ctx->selected_option == MenuPulsosWidth) ? ">" : " ",
-                    ctx->motor_pulse_period_ms);
+                    ctx->motor_pulse_interval_us);
                 break;
             case MenuRepetitions:
                 snprintf(
@@ -291,10 +292,11 @@ int32_t ruleta_laser_app(void* p) {
         .status_active = false,
         .state = StateConfig, // Arranca en el menú de configuración
         .current_pulse = 0,
-        .motor_pulse_count = 10, // Por defecto 10 pulsos
-        .motor_pulse_width_us = 1000, // Por defecto 5000us (5ms) por pulso
-        .motor_pulse_period_ms = 3000, // Por defecto 3 segundos entre grupos
-        .total_repetitions = 3, // Por defecto 3 repeticiones
+        .motor_pulse_count = 400, // Por defecto 400 pulsos por sentido
+        .motor_pulse_width_us = 100, // Ancho de pulso recomendado para el driver (100 us)
+        .motor_pulse_interval_us = 1000, // Intervalo entre pulsos (1 ms)
+        .motor_pulse_period_ms = 3000, // Tiempo entre ciclos completos de ejecución
+        .total_repetitions = 1, // Por defecto 3 repeticiones
         .repetitions_remaining = 0,
         .selected_option = MenuPulsosCount,
         .help_scroll_offset = 0,
@@ -377,7 +379,7 @@ int32_t ruleta_laser_app(void* p) {
                         else if(context.selected_option == MenuPulsosPeriod)
                             context.motor_pulse_width_us += 100;
                         else if(context.selected_option == MenuPulsosWidth)
-                            context.motor_pulse_period_ms += 250;
+                            context.motor_pulse_interval_us += 100;
                         else if(context.selected_option == MenuRepetitions &&
                                 context.total_repetitions < 100)
                             context.total_repetitions += 1;
@@ -392,8 +394,8 @@ int32_t ruleta_laser_app(void* p) {
                             context.motor_pulse_width_us -= 100;
                         else if(
                             context.selected_option == MenuPulsosWidth &&
-                            context.motor_pulse_period_ms > 250)
-                            context.motor_pulse_period_ms -= 250;
+                            context.motor_pulse_interval_us > 100)
+                            context.motor_pulse_interval_us -= 100;
                         else if(context.selected_option == MenuRepetitions &&
                                 context.total_repetitions > 1)
                             context.total_repetitions -= 1;
@@ -474,7 +476,7 @@ int32_t ruleta_laser_app(void* p) {
                         // 2. Pulso Bajo: desactiva la salida para cerrar el pulso.
                         furi_hal_gpio_write(context.pin, false);
                         furi_hal_light_set(LightRed, 0);
-                        furi_delay_us(context.motor_pulse_width_us);
+                        furi_delay_us(context.motor_pulse_interval_us);
                     }
                 }
 
