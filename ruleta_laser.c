@@ -167,7 +167,7 @@ static void render_callback(Canvas* canvas, void* context) {
             canvas_draw_str(canvas, 4, y, buf);
         }
 
-        /canvas_draw_str(canvas, 2, 64, "[OK] Confirmar/Ayuda");/
+        /*canvas_draw_str(canvas, 2, 64, "[OK] Confirmar/Ayuda");*/
     }
     // --- PANTALLA DE AYUDA ---
     else if(ctx->state == StateHelp) {
@@ -191,7 +191,7 @@ static void render_callback(Canvas* canvas, void* context) {
             }
         }
 
-        /canvas_draw_str(canvas, 2, 58, "Sube/Baja para ver mas");/
+        //canvas_draw_str(canvas, 2, 58, "Sube/Baja para ver mas");
     }
     // --- PANTALLA DE CONFIRMACIÓN ---
     else if(ctx->state == StateConfirm) {
@@ -292,7 +292,7 @@ int32_t ruleta_laser_app(void* p) {
         .state = StateConfig, // Arranca en el menú de configuración
         .current_pulse = 0,
         .motor_pulse_count = 10, // Por defecto 10 pulsos
-        .motor_pulse_width_us = 5000, // Por defecto 5000us (5ms) por pulso
+        .motor_pulse_width_us = 1000, // Por defecto 5000us (5ms) por pulso
         .motor_pulse_period_ms = 3000, // Por defecto 3 segundos entre grupos
         .total_repetitions = 3, // Por defecto 3 repeticiones
         .repetitions_remaining = 0,
