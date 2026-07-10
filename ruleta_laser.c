@@ -3,6 +3,7 @@
 #include <furi.h>
 #include <furi_hal_gpio.h>
 #include <furi_hal_light.h>
+#include <furi_hal_pwm.h>
 #include <gui/gui.h>
 #include <gui/view_port.h>
 #include <input/input.h>
@@ -267,6 +268,19 @@ static void motor_timer_callback(void* queue_context) {
     furi_message_queue_put(event_queue, &event, 0);
 }
 
+static void emit_pwm_pulse_block(uint32_t pulse_count, uint32_t pulse_width_us) {
+    if(pulse_count == 0 || pulse_width_us == 0) return;
+
+    const uint32_t half_period_us = pulse_width_us;
+    const uint32_t block_duration_us = pulse_count * (half_period_us * 2);
+    uint32_t pwm_freq_hz = 1000000u / (half_period_us * 2);
+    if(pwm_freq_hz == 0) pwm_freq_hz = 1;
+
+    furi_hal_pwm_start(FuriHalPwmOutputIdTim1PA7, pwm_freq_hz, 50);
+    furi_delay_us(block_duration_us);
+    furi_hal_pwm_stop(FuriHalPwmOutputIdTim1PA7);
+}
+
 int32_t ruleta_laser_app(void* p) {
     // Punto de entrada principal de la aplicación del alimentador laser.
     UNUSED(p);
@@ -465,16 +479,13 @@ int32_t ruleta_laser_app(void* p) {
                                 break;
                             }
                         }
-
-                        // 1. Pulso Alto: activa la salida para generar un pulso de trabajo.
-                        furi_hal_gpio_write(context.pin, true);
-                        furi_hal_light_set(LightRed, 255);
-                        furi_delay_us(context.motor_pulse_width_us);
-
-                        // 2. Pulso Bajo: desactiva la salida para cerrar el pulso.
-                        furi_hal_gpio_write(context.pin, false);
-                        furi_hal_light_set(LightRed, 0);
                     }
+
+                    if(context.state != StateRunning) break;
+
+                    furi_hal_light_set(LightRed, 255);
+                    emit_pwm_pulse_block(context.motor_pulse_count, context.motor_pulse_width_us);
+                    furi_hal_light_set(LightRed, 0);
                 }
 
                 FURI_LOG_I("ruleta_laser", "Sent %lu pulses", context.motor_pulse_count);
