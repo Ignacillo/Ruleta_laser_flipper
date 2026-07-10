@@ -1,4 +1,4 @@
-/*Sistema para avanzar la ruleta de placas laser mediante pulsos al PAP con Menú Interactivo*/
+/Sistema para avanzar la ruleta de placas laser mediante pulsos al PAP con Menú Interactivo/
 
 #include <furi.h>
 #include <furi_hal_gpio.h>
@@ -11,34 +11,46 @@
 #include <ruleta_laser_icons.h>
 
 #define MOTOR_PIN_PORT   GPIOA
+/* La salida está en el pin 7 */
 #define MOTOR_PIN_NUMBER LL_GPIO_PIN_7
+#define DIRECTION_PIN_PORT GPIOA
+/* La dirección se controla en el pin 6 */
+#define DIRECTION_PIN_NUMBER LL_GPIO_PIN_6
 
 typedef enum {
-    StateConfig, // Nuevo estado: Configuración de parámetros
-    StateConfirm,
-    StateRunning,
+    StateConfig, // Pantalla principal donde se ajustan los parámetros del movimiento
+    StateConfirm, // Pantalla de confirmación antes de iniciar la ejecución
+    StateHelp, // Pantalla de ayuda con instrucciones de uso
+    StateRunning, // Estado de ejecución activa del alimentador
 } AppState;
 
-// Índice de la opción seleccionada en el menú
+// Índice de la opción seleccionada en el menú de configuración
 typedef enum {
     MenuPulsosCount = 0,
     MenuPulsosPeriod,
     MenuPulsosWidth,
+    MenuRepetitions,
+    MenuHelp,
     Menu_MaxOptions
 } MenuOption;
 
 typedef struct {
-    const GpioPin* pin;
-    bool status_active;
-    AppState state;
-    uint32_t current_pulse;
+    const GpioPin* pin; // Pin digital usado para emitir los pulsos del motor
+    const GpioPin* direction_pin; // Pin digital usado para invertir el sentido de giro
+    bool status_active; // Indica si el sistema está enviando pulsos en este momento
+    AppState state; // Estado actual de la interfaz del programa
+    uint32_t current_pulse; // Pulso actual dentro del ciclo de ejecución
 
     // --- VARIABLES DINÁMICAS (Configurables) ---
-    uint32_t motor_pulse_count; // Cantidad de pulsos por grupo
-    uint32_t motor_pulse_period_ms; // Intervalo entre grupos (Timer de Flipper)
-    uint32_t motor_pulse_width_ms; // Intervalo entre pulsos (Ancho/espera del pulso en milisegundos)
+    uint32_t motor_pulse_count; // Número de pulsos que se envían en cada sentido
+    uint32_t motor_pulse_period_ms; // Tiempo entre ciclos completos de ejecución
+    uint32_t motor_pulse_width_ms; // Ancho de cada pulso en milisegundos
+    uint32_t total_repetitions; // Número total de repeticiones del ciclo completo
+    uint32_t repetitions_remaining; // Repeticiones que quedan por ejecutar
 
-    MenuOption selected_option; // Opción seleccionada en el menú
+    MenuOption selected_option; // Opción actualmente resaltada en el menú
+    uint8_t help_scroll_offset; // Desplazamiento vertical de la pantalla de ayuda
+    uint8_t config_scroll_offset; // Desplazamiento vertical del menú de configuración
 } MotorPulsesContext;
 
 typedef enum {
@@ -51,53 +63,141 @@ typedef struct {
     InputEvent input;
 } AppEvent;
 
+// Texto mostrado en la pantalla de ayuda, dividido en líneas para permitir scroll
+static const char* const help_lines[] = {
+    "Arriba/Abajo: ",
+    "moverte por texto",
+    "Izq/Der: ",
+    "ajusta el valor activo",
+    "OK: confirma o entra ",
+    "en Ayuda",
+    "Atras: vuelve o ",
+    "cancela ejecucion",
+    "cancela ejecucion",
+    "Pulsos: cantidad de ",
+    "pulsos por grupo",
+    "Int. Pulso: ancho", 
+    "de cada pulso",
+    "Int. Grupo: tiempo ",
+    "entre grupos",
+    "Pin: PA7 (GPIOA7)",
+    "para el motor",
+    "El pin se activa y",
+    "desactiva en cada ",
+    "pulso",
+};
+
 static void render_callback(Canvas* canvas, void* context) {
     MotorPulsesContext* ctx = context;
     canvas_clear(canvas);
 
+    char buf[32];
+
+    // Esta función se encarga de pintar la interfaz según el estado actual.
+    // Hay pantallas distintas para configuración, ayuda, confirmación y ejecución.
+
     // --- PANTALLA DE CONFIGURACIÓN ---
     if(ctx->state == StateConfig) {
+        // Pantalla principal de configuración del alimentador.
         canvas_set_font(canvas, FontPrimary);
         canvas_draw_str(canvas, 2, 12, "Configuracion Motor");
 
         canvas_set_font(canvas, FontSecondary);
 
-        // Formatear cadenas para mostrar los valores actuales
-        char buf[32];
+        const uint8_t visible_lines = 4;
+        const uint8_t line_height = 12;
+        const uint8_t start_y = 24;
+        const uint8_t total_lines = Menu_MaxOptions;
+        const uint8_t max_scroll = (total_lines > visible_lines) ? (total_lines - visible_lines) : 0;
 
-        // Opción 1: Cantidad de pulsos
-        snprintf(
-            buf,
-            sizeof(buf),
-            "%s Pulsos: %lu",
-            (ctx->selected_option == MenuPulsosCount) ? ">" : " ",
-            ctx->motor_pulse_count);
-        canvas_draw_str(canvas, 4, 26, buf);
+        if(ctx->config_scroll_offset > max_scroll) {
+            ctx->config_scroll_offset = max_scroll;
+        }
 
-        // Opción 2: Intervalo entre pulsos (Ancho del paso)
-        snprintf(
-            buf,
-            sizeof(buf),
-            "%s Int. Pulso: %lu ms",
-            (ctx->selected_option == MenuPulsosPeriod) ? ">" : " ",
-            ctx->motor_pulse_width_ms);
-        canvas_draw_str(canvas, 4, 38, buf);
+        for(uint8_t i = 0; i < visible_lines; i++) {
+            uint8_t option_index = ctx->config_scroll_offset + i;
+            if(option_index >= Menu_MaxOptions) break;
 
-        // Opción 3: Intervalo entre grupos (Frecuencia del timer)
-        snprintf(
-            buf,
-            sizeof(buf),
-            "%s Int. Grupo: %lu ms",
-            (ctx->selected_option == MenuPulsosWidth) ? ">" : " ",
-            ctx->motor_pulse_period_ms);
-        canvas_draw_str(canvas, 4, 50, buf);
+            uint8_t y = start_y + (i * line_height);
+            switch(option_index) {
+            case MenuPulsosCount:
+                snprintf(
+                    buf,
+                    sizeof(buf),
+                    "%s Pulsos: %lu",
+                    (ctx->selected_option == MenuPulsosCount) ? ">" : " ",
+                    ctx->motor_pulse_count);
+                break;
+            case MenuPulsosPeriod:
+                snprintf(
+                    buf,
+                    sizeof(buf),
+                    "%s Int. Pulso: %lu ms",
+                    (ctx->selected_option == MenuPulsosPeriod) ? ">" : " ",
+                    ctx->motor_pulse_width_ms);
+                break;
+            case MenuPulsosWidth:
+                snprintf(
+                    buf,
+                    sizeof(buf),
+                    "%s Int. Grupo: %lu ms",
+                    (ctx->selected_option == MenuPulsosWidth) ? ">" : " ",
+                    ctx->motor_pulse_period_ms);
+                break;
+            case MenuRepetitions:
+                snprintf(
+                    buf,
+                    sizeof(buf),
+                    "%s Repet.: %lu",
+                    (ctx->selected_option == MenuRepetitions) ? ">" : " ",
+                    ctx->total_repetitions);
+                break;
+            case MenuHelp:
+                snprintf(
+                    buf,
+                    sizeof(buf),
+                    "%s Ayuda",
+                    (ctx->selected_option == MenuHelp) ? ">" : " ");
+                break;
+            default:
+                buf[0] = '\0';
+                break;
+            }
 
-        canvas_draw_str(canvas, 2, 62, "[OK] Confirmar  [< >] Ajustar");
+            canvas_draw_str(canvas, 4, y, buf);
+        }
+
+        /canvas_draw_str(canvas, 2, 64, "[OK] Confirmar/Ayuda");/
+    }
+    // --- PANTALLA DE AYUDA ---
+    else if(ctx->state == StateHelp) {
+        // Pantalla de ayuda con instrucciones y explicación de los comandos.
+        canvas_set_font(canvas, FontPrimary);
+        canvas_draw_str(canvas, 2, 12, "Ayuda");
+
+        canvas_set_font(canvas, FontSecondary);
+        const uint8_t visible_lines = 5;
+        const uint8_t total_lines = sizeof(help_lines) / sizeof(help_lines[0]);
+        const uint8_t max_scroll = (total_lines > visible_lines) ? (total_lines - visible_lines) : 0;
+
+        if(ctx->help_scroll_offset > max_scroll) {
+            ctx->help_scroll_offset = max_scroll;
+        }
+
+        for(uint8_t i = 0; i < visible_lines; i++) {
+            uint8_t line_index = ctx->help_scroll_offset + i;
+            if(line_index < total_lines) {
+                canvas_draw_str(canvas, 2, 24 + (i * 8), help_lines[line_index]);
+            }
+        }
+
+        /canvas_draw_str(canvas, 2, 58, "Sube/Baja para ver mas");/
     }
     // --- PANTALLA DE CONFIRMACIÓN ---
     else if(ctx->state == StateConfirm) {
+        // Pantalla previa a iniciar la ejecución del movimiento.
         canvas_set_font(canvas, FontPrimary);
-        canvas_draw_str(canvas, 2, 15, "¿Iniciar Ruleta?");
+        canvas_draw_str(canvas, 2, 15, "¿Iniciar Alimentador?");
 
         canvas_set_font(canvas, FontSecondary);
         canvas_draw_str(canvas, 2, 35, "Presiona OK para empezar");
@@ -105,27 +205,52 @@ static void render_callback(Canvas* canvas, void* context) {
     }
     // --- PANTALLA EN EJECUCIÓN ---
     else if(ctx->state == StateRunning) {
+        // Pantalla de ejecución activa, donde se muestra el progreso del ciclo.
         canvas_set_font(canvas, FontPrimary);
-        canvas_draw_str(canvas, 2, 12, "Ruleta Laser");
+        canvas_draw_str(canvas, 2, 12, "Alimentador Laser");
 
         canvas_set_font(canvas, FontSecondary);
         if(ctx->status_active) {
-            canvas_draw_str(canvas, 2, 26, "Enviando pulsos...");
+            canvas_draw_str(canvas, 2, 23, "Enviando pulsos...");
 
             // --- DIBUJAR BARRA DE PROGRESO ---
-            canvas_draw_rframe(canvas, 2, 32, 124, 10, 2);
-            uint32_t bar_width = (ctx->current_pulse * 120) / ctx->motor_pulse_count;
-            if(bar_width > 120) bar_width = 120;
-            canvas_draw_box(canvas, 4, 34, bar_width, 6);
+            canvas_draw_rframe(canvas, 2, 27, 124, 10, 2);
+
+            uint32_t total_steps = ctx->motor_pulse_count;
+            if(total_steps == 0) total_steps = 1;
+
+            uint32_t progress = 0;
+            if(ctx->current_pulse <= total_steps) {
+                progress = (ctx->current_pulse * 120) / total_steps;
+            } else {
+                uint32_t return_step = ctx->current_pulse - total_steps;
+                progress = 120 - ((return_step * 120) / total_steps);
+            }
+
+            if(progress > 120) progress = 120;
+
+            if(ctx->current_pulse <= total_steps) {
+                canvas_draw_box(canvas, 4, 29, progress, 6);
+            } else {
+                canvas_draw_box(canvas, 4 + progress, 29, 120 - progress, 6);
+            }
         } else {
-            canvas_draw_str(canvas, 2, 30, "Esperando timer...");
+            canvas_draw_str(canvas, 2, 23, "Esperando timer...");
         }
 
-        canvas_draw_str(canvas, 2, 55, "Presiona ATRAS para parar");
+        snprintf(
+            buf,
+            sizeof(buf),
+            "Restantes: %lu/%lu",
+            ctx->repetitions_remaining,
+            ctx->total_repetitions);
+        canvas_draw_str(canvas, 2, 50, buf);
+        canvas_draw_str(canvas, 2, 60, "Presiona ATRAS para parar");
     }
 }
 
 static void input_callback(InputEvent* input_event, void* queue_context) {
+    // Reenvía los eventos de entrada al sistema de colas para procesarlos en el bucle principal.
     furi_assert(queue_context);
     FuriMessageQueue* event_queue = queue_context;
 
@@ -134,6 +259,7 @@ static void input_callback(InputEvent* input_event, void* queue_context) {
 }
 
 static void motor_timer_callback(void* queue_context) {
+    // Genera un evento periódico para ejecutar el ciclo de pulsos según el periodo configurado.
     furi_assert(queue_context);
     FuriMessageQueue* event_queue = queue_context;
 
@@ -142,18 +268,26 @@ static void motor_timer_callback(void* queue_context) {
 }
 
 int32_t ruleta_laser_app(void* p) {
+    // Punto de entrada principal de la aplicación del alimentador laser.
     UNUSED(p);
 
     FuriMessageQueue* event_queue = furi_message_queue_alloc(8, sizeof(AppEvent));
 
+    // Define los pines digitales usados para el pulso y para el sentido de giro.
     static const GpioPin motor_pin = {
         .port = MOTOR_PIN_PORT,
         .pin = MOTOR_PIN_NUMBER,
     };
 
-    // Inicializamos el contexto con valores por defecto mutables
+    static const GpioPin direction_pin = {
+        .port = DIRECTION_PIN_PORT,
+        .pin = DIRECTION_PIN_NUMBER,
+    };
+
+    // Inicializa el contexto con parámetros por defecto que luego podrán ajustarse desde el menú.
     MotorPulsesContext context = {
         .pin = &motor_pin,
+        .direction_pin = &direction_pin,
         .status_active = false,
         .state = StateConfig, // Arranca en el menú de configuración
         .current_pulse = 0,
@@ -161,11 +295,18 @@ int32_t ruleta_laser_app(void* p) {
         .motor_pulse_width_ms =
             50, // Por defecto 50ms en alto y 50ms en bajo (anteriormente 50000us)
         .motor_pulse_period_ms = 3000, // Por defecto 3 segundos entre grupos
+        .total_repetitions = 3, // Por defecto 3 repeticiones
+        .repetitions_remaining = 0,
         .selected_option = MenuPulsosCount,
+        .help_scroll_offset = 0,
+        .config_scroll_offset = 0,
     };
 
+    // Configura los pines como salidas digitales y los deja en estado inicial seguro.
     furi_hal_gpio_init_simple(&motor_pin, GpioModeOutputPushPull);
+    furi_hal_gpio_init_simple(&direction_pin, GpioModeOutputPushPull);
     furi_hal_gpio_write(&motor_pin, false);
+    furi_hal_gpio_write(&direction_pin, true);
 
     ViewPort* view_port = view_port_alloc();
     view_port_draw_callback_set(view_port, render_callback, &context);
@@ -176,7 +317,7 @@ int32_t ruleta_laser_app(void* p) {
 
     FuriTimer* timer = furi_timer_alloc(motor_timer_callback, FuriTimerTypePeriodic, event_queue);
     if(timer == NULL) {
-        FURI_LOG_E("ruleta_laser", "Failed to allocate timer");
+        FURI_LOG_E("Alimentador_laser", "Failed to allocate timer");
         view_port_free(view_port);
         furi_record_close(RECORD_GUI);
         furi_message_queue_free(event_queue);
@@ -187,18 +328,23 @@ int32_t ruleta_laser_app(void* p) {
     bool running = true;
     bool timer_started = false;
 
+    // Bucle principal de la aplicación: procesa eventos de entrada y temporización.
+
     while(running) {
         FuriStatus status = furi_message_queue_get(event_queue, &event, FuriWaitForever);
 
         if(status == FuriStatusOk) {
             if(event.type == EventTypeInput) {
-                // MAVENGACIÓN GENERAL DEL BOTÓN ATRÁS
+                // Manejo del botón de retroceso: salir, volver atrás o detener la ejecución.
                 if(event.input.key == InputKeyBack && event.input.type == InputTypeShort) {
                     if(context.state == StateConfig) {
                         FURI_LOG_I("ruleta_laser", "Exiting app from config");
                         running = false;
                     } else if(context.state == StateConfirm) {
                         context.state = StateConfig; // Regresar a configurar
+                    } else if(context.state == StateHelp) {
+                        context.help_scroll_offset = 0;
+                        context.state = StateConfig; // Volver al menú de configuración
                     } else if(context.state == StateRunning) {
                         FURI_LOG_I("ruleta_laser", "Stopping execution");
                         if(timer_started) {
@@ -209,13 +355,22 @@ int32_t ruleta_laser_app(void* p) {
                     }
                 }
 
-                // LÓGICA DE INTERACCIÓN EN ESTADO DE CONFIGURACIÓN
+                // Lógica del menú de configuración: navegar entre opciones y modificar sus valores.
                 else if(context.state == StateConfig && event.input.type == InputTypeShort) {
                     if(event.input.key == InputKeyUp) {
-                        if(context.selected_option > 0) context.selected_option--;
+                        if(context.selected_option > 0) {
+                            context.selected_option--;
+                            if(context.selected_option < context.config_scroll_offset) {
+                                context.config_scroll_offset = context.selected_option;
+                            }
+                        }
                     } else if(event.input.key == InputKeyDown) {
-                        if(context.selected_option < Menu_MaxOptions - 1)
+                        if(context.selected_option < Menu_MaxOptions - 1) {
                             context.selected_option++;
+                            if(context.selected_option >= context.config_scroll_offset + 4) {
+                                context.config_scroll_offset = context.selected_option - 3;
+                            }
+                        }
                     } else if(event.input.key == InputKeyRight) {
                         // Incrementar valores según la opción
                         if(context.selected_option == MenuPulsosCount)
@@ -224,6 +379,9 @@ int32_t ruleta_laser_app(void* p) {
                             context.motor_pulse_width_ms += 5;
                         else if(context.selected_option == MenuPulsosWidth)
                             context.motor_pulse_period_ms += 250;
+                        else if(context.selected_option == MenuRepetitions &&
+                                context.total_repetitions < 100)
+                            context.total_repetitions += 1;
                     } else if(event.input.key == InputKeyLeft) {
                         // Decrementar valores (evitando que bajen de límites seguros)
                         if(context.selected_option == MenuPulsosCount &&
@@ -237,16 +395,41 @@ int32_t ruleta_laser_app(void* p) {
                             context.selected_option == MenuPulsosWidth &&
                             context.motor_pulse_period_ms > 250)
                             context.motor_pulse_period_ms -= 250;
+                        else if(context.selected_option == MenuRepetitions &&
+                                context.total_repetitions > 1)
+                            context.total_repetitions -= 1;
                     } else if(event.input.key == InputKeyOk) {
-                        context.state = StateConfirm; // Pasar a confirmación
+                        if(context.selected_option == MenuHelp) {
+                            context.state = StateHelp;
+                        } else {
+                            context.state = StateConfirm; // Pasar a confirmación
+                        }
                     }
                 }
 
-                // LÓGICA EN ESTADO DE CONFIRMACIÓN
+                // Lógica de la pantalla de ayuda: permitir desplazarse por sus líneas de texto.
+                else if(context.state == StateHelp && event.input.type == InputTypeShort) {
+                    if(event.input.key == InputKeyUp) {
+                        if(context.help_scroll_offset > 0) context.help_scroll_offset--;
+                    } else if(event.input.key == InputKeyDown) {
+                        const uint8_t visible_lines = 5;
+                        const uint8_t total_lines = sizeof(help_lines) / sizeof(help_lines[0]);
+                        const uint8_t max_scroll =
+                            (total_lines > visible_lines) ? (total_lines - visible_lines) : 0;
+                        if(context.help_scroll_offset < max_scroll)
+                            context.help_scroll_offset++;
+                    } else if(event.input.key == InputKeyBack || event.input.key == InputKeyOk) {
+                        context.help_scroll_offset = 0;
+                        context.state = StateConfig;
+                    }
+                }
+
+                // Lógica de la pantalla de confirmación: iniciar el ciclo si el usuario acepta.
                 else if(
                     context.state == StateConfirm && event.input.key == InputKeyOk &&
                     event.input.type == InputTypeShort) {
                     FURI_LOG_I("ruleta_laser", "Starting motor pulse generator on PA7");
+                    context.repetitions_remaining = context.total_repetitions;
                     context.state = StateRunning;
                     // Se inicia el timer usando el periodo configurado dinámicamente
                     furi_timer_start(timer, furi_ms_to_ticks(context.motor_pulse_period_ms));
@@ -254,45 +437,65 @@ int32_t ruleta_laser_app(void* p) {
                 }
 
             } else if(event.type == EventTypeTick && context.state == StateRunning) {
+                // Cada tick del temporizador dispara un ciclo completo de ejecución.
                 context.status_active = true;
                 context.current_pulse = 0;
                 view_port_update(view_port);
 
-                // --- BUCLE DE PULSOS CONTROLADO CON VARIABLES DEL MENÚ ---
-                for(uint32_t i = 0; i < context.motor_pulse_count; i++) {
-                    context.current_pulse = i + 1;
-                    view_port_update(view_port);
+                // Bucle principal de movimiento: primero avanza, luego retrocede, según la dirección activa.
+                for(uint32_t phase = 0; phase < 2; phase++) {
+                    bool direction_forward = (phase == 0);
+                    furi_hal_gpio_write(context.direction_pin, direction_forward);
 
-                    // REVISIÓN DE BOTÓN DE EMERGENCIA INTERNA
-                    AppEvent micro_event;
-                    if(furi_message_queue_get(event_queue, &micro_event, 0) == FuriStatusOk) {
-                        if(micro_event.type == EventTypeInput &&
-                           micro_event.input.key == InputKeyBack &&
-                           micro_event.input.type == InputTypeShort) {
-                            FURI_LOG_I("ruleta_laser", "Emergency stop triggered by user");
-                            context.state = StateConfig;
-                            if(timer_started) {
-                                furi_timer_stop(timer);
-                                timer_started = false;
+                    for(uint32_t i = 0; i < context.motor_pulse_count; i++) {
+                        context.current_pulse = (phase * context.motor_pulse_count) + i + 1;
+                        view_port_update(view_port);
+
+                        // REVISIÓN DE BOTÓN DE EMERGENCIA INTERNA
+                        AppEvent micro_event;
+                        if(furi_message_queue_get(event_queue, &micro_event, 0) == FuriStatusOk) {
+                            if(micro_event.type == EventTypeInput &&
+                               micro_event.input.key == InputKeyBack &&
+                               micro_event.input.type == InputTypeShort) {
+                                FURI_LOG_I("ruleta_laser", "Emergency stop triggered by user");
+                                context.state = StateConfig;
+                                if(timer_started) {
+                                    furi_timer_stop(timer);
+                                    timer_started = false;
+                                }
+                                break;
                             }
-                            break;
                         }
+
+                        // 1. Pulso Alto: activa la salida para generar un pulso de trabajo.
+                        furi_hal_gpio_write(context.pin, true);
+                        furi_hal_light_set(LightRed, 255);
+                        furi_delay_ms(context.motor_pulse_width_ms);
+
+                        // 2. Pulso Bajo: desactiva la salida para cerrar el pulso.
+                        furi_hal_gpio_write(context.pin, false);
+                        furi_hal_light_set(LightRed, 0);
+                        furi_delay_ms(context.motor_pulse_width_ms);
                     }
-
-                    // 1. Pulso Alto
-                    furi_hal_gpio_write(context.pin, true);
-                    furi_hal_light_set(LightRed, 255);
-                    furi_delay_ms(context.motor_pulse_width_ms);
-
-                    // 2. Pulso Bajo
-                    furi_hal_gpio_write(context.pin, false);
-                    furi_hal_light_set(LightRed, 0);
-                    furi_delay_ms(context.motor_pulse_width_ms);
                 }
 
                 FURI_LOG_I("ruleta_laser", "Sent %lu pulses", context.motor_pulse_count);
                 context.status_active = false;
                 context.current_pulse = 0;
+
+                if(context.repetitions_remaining > 0) {
+                    context.repetitions_remaining--;
+                }
+
+                if(context.repetitions_remaining == 0) {
+                    FURI_LOG_I("ruleta_laser", "Completed all configured repetitions");
+                    if(timer_started) {
+                        furi_timer_stop(timer);
+                        timer_started = false;
+                    }
+                    context.state = StateConfig;
+                }
+
                 view_port_update(view_port);
             }
         }
@@ -306,6 +509,7 @@ int32_t ruleta_laser_app(void* p) {
     furi_timer_free(timer);
 
     furi_hal_gpio_write(&motor_pin, false);
+    furi_hal_gpio_write(&direction_pin, true);
     furi_hal_light_set(LightRed, 0);
 
     gui_remove_view_port(gui, view_port);
