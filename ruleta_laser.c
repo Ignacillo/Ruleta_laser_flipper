@@ -18,6 +18,10 @@
 #define DIRECTION_PIN_PORT GPIOA
 /* La dirección se controla en el pin 6 */
 #define DIRECTION_PIN_NUMBER LL_GPIO_PIN_6
+#define LASER_PIN_PORT GPIOA
+#define LASER_PIN_NUMBER LL_GPIO_PIN_4
+#define LASER_PULSE_MS 300
+
 #define SETTINGS_FILE_PATH "/int/ruleta_laser_settings.bin"
 
 typedef enum {
@@ -345,7 +349,7 @@ int32_t ruleta_laser_app(void* p) {
 
     FuriMessageQueue* event_queue = furi_message_queue_alloc(8, sizeof(AppEvent));
 
-    // Define los pines digitales usados para el pulso y para el sentido de giro.
+    // Define los pines digitales usados para el pulso, la dirección y el láser.
     static const GpioPin motor_pin = {
         .port = MOTOR_PIN_PORT,
         .pin = MOTOR_PIN_NUMBER,
@@ -356,6 +360,11 @@ int32_t ruleta_laser_app(void* p) {
         .pin = DIRECTION_PIN_NUMBER,
     };
 
+    static const GpioPin laser_pin = {
+        .port = LASER_PIN_PORT,
+        .pin = LASER_PIN_NUMBER,
+    };
+
     // Inicializa el contexto con parámetros por defecto que luego podrán ajustarse desde el menú.
     MotorPulsesContext context = {
         .pin = &motor_pin,
@@ -363,7 +372,7 @@ int32_t ruleta_laser_app(void* p) {
         .status_active = false,
         .state = StateConfig, // Arranca en el menú de configuración
         .current_pulse = 0,
-        .motor_pulse_count = 400, // Por defecto 400 pulsos por sentido
+        .motor_pulse_count = 3300, // Por defecto 3300 pulsos por sentido
         .motor_pulse_width_us = 100, // Ancho de pulso recomendado para el driver (100 us)
         .motor_pulse_period_ms = 3000, // Intervalo entre grupos de pulsos
         .total_repetitions = 1, // Por defecto 3 repeticiones
@@ -378,8 +387,10 @@ int32_t ruleta_laser_app(void* p) {
     // Configura los pines como salidas digitales y los deja en estado inicial seguro.
     furi_hal_gpio_init_simple(&motor_pin, GpioModeOutputPushPull);
     furi_hal_gpio_init_simple(&direction_pin, GpioModeOutputPushPull);
+    furi_hal_gpio_init_simple(&laser_pin, GpioModeOutputPushPull);
     furi_hal_gpio_write(&motor_pin, false);
     furi_hal_gpio_write(&direction_pin, true);
+    furi_hal_gpio_write(&laser_pin, false);
 
     ViewPort* view_port = view_port_alloc();
     view_port_draw_callback_set(view_port, render_callback, &context);
@@ -452,8 +463,7 @@ int32_t ruleta_laser_app(void* p) {
                             context.motor_pulse_width_us += 10;
                         else if(context.selected_option == MenuPulsosWidth)
                             context.motor_pulse_period_ms += 250;
-                        else if(context.selected_option == MenuRepetitions &&
-                                context.total_repetitions < 100)
+                        else if(context.selected_option == MenuRepetitions)
                             context.total_repetitions += 1;
                     } else if(event.input.key == InputKeyLeft) {
                         // Decrementar valores (evitando que bajen de límites seguros)
@@ -470,7 +480,11 @@ int32_t ruleta_laser_app(void* p) {
                             context.motor_pulse_period_ms -= 250;
                         else if(context.selected_option == MenuRepetitions &&
                                 context.total_repetitions > 1)
-                            context.total_repetitions -= 100;
+                            context.total_repetitions -= 1;
+
+                        if(context.total_repetitions < 1) {
+                            context.total_repetitions = 1;
+                        }
 
                         save_settings(&context);
                     } else if(event.input.key == InputKeyOk) {
@@ -552,6 +566,12 @@ int32_t ruleta_laser_app(void* p) {
                     furi_hal_light_set(LightRed, 0);
                 }
 
+                if(context.state == StateRunning) {
+                    furi_hal_gpio_write(&laser_pin, true);
+                    furi_delay_ms(LASER_PULSE_MS);
+                    furi_hal_gpio_write(&laser_pin, false);
+                }
+
                 FURI_LOG_I("ruleta_laser", "Sent %lu pulses", context.motor_pulse_count);
                 context.status_active = false;
                 context.current_pulse = 0;
@@ -585,6 +605,7 @@ int32_t ruleta_laser_app(void* p) {
 
     furi_hal_gpio_write(&motor_pin, false);
     furi_hal_gpio_write(&direction_pin, true);
+    furi_hal_gpio_write(&laser_pin, false);
     furi_hal_light_set(LightRed, 0);
 
     gui_remove_view_port(gui, view_port);
