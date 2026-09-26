@@ -20,6 +20,9 @@
 #define DIRECTION_PIN_NUMBER LL_GPIO_PIN_6
 #define LASER_PIN_PORT GPIOA
 #define LASER_PIN_NUMBER LL_GPIO_PIN_4
+#define HOME_SWITCH_PIN_PORT GPIOA
+#define HOME_SWITCH_PIN_NUMBER LL_GPIO_PIN_5
+#define HOME_SWITCH_SEARCH_LIMIT_PERCENT 125u
 #define LASER_PULSE_MS 300
 
 #define SETTINGS_FILE_PATH "/int/ruleta_laser_settings.bin"
@@ -29,6 +32,7 @@ typedef enum {
     StateConfirm, // Pantalla de confirmación antes de iniciar la ejecución
     StateHelp, // Pantalla de ayuda con instrucciones de uso
     StateRunning, // Estado de ejecución activa del alimentador
+    StateError, // Error del sistema: no se detectó el botón de home
 } AppState;
 
 // Índice de la opción seleccionada en el menú de configuración
@@ -217,6 +221,16 @@ static void render_callback(Canvas* canvas, void* context) {
         canvas_draw_str(canvas, 2, 35, "Presiona OK para empezar");
         canvas_draw_str(canvas, 2, 50, "Presiona ATRAS para volver");
     }
+    // --- PANTALLA DE ERROR ---
+    else if(ctx->state == StateError) {
+        canvas_set_font(canvas, FontPrimary);
+        canvas_draw_str(canvas, 2, 15, "ERROR");
+
+        canvas_set_font(canvas, FontSecondary);
+        canvas_draw_str(canvas, 2, 35, "No se detecto HOME");
+        canvas_draw_str(canvas, 2, 50, "Recorrido excedido");
+        canvas_draw_str(canvas, 2, 62, "Atras: volver");
+    }
     // --- PANTALLA EN EJECUCIÓN ---
     else if(ctx->state == StateRunning) {
         // Pantalla de ejecución activa, donde se muestra el progreso del ciclo.
@@ -281,17 +295,20 @@ static void motor_timer_callback(void* queue_context) {
     furi_message_queue_put(event_queue, &event, 0);
 }
 
-static void emit_pwm_pulse_block(uint32_t pulse_count, uint32_t pulse_width_us) {
-    if(pulse_count == 0 || pulse_width_us == 0) return;
+static bool home_switch_is_pressed(const GpioPin* pin) {
+    if(pin == NULL) return false;
 
-    const uint32_t half_period_us = pulse_width_us;
-    const uint32_t block_duration_us = pulse_count * (half_period_us * 2);
-    uint32_t pwm_freq_hz = 1000000u / (half_period_us * 2);
-    if(pwm_freq_hz == 0) pwm_freq_hz = 1;
-
-    furi_hal_pwm_start(FuriHalPwmOutputIdTim1PA7, pwm_freq_hz, 50);
-    furi_delay_us(block_duration_us);
-    furi_hal_pwm_stop(FuriHalPwmOutputIdTim1PA7);
+    // Botón NC con pull-up externo: en reposo está cerrado y vale LOW,
+    // cuando se pulsa/abre el circuito vale HIGH. Con debounce se evitan rebotes.
+    bool active = true;
+    for(uint8_t i = 0; i < 4; i++) {
+        if(furi_hal_gpio_read(pin) == false) {
+            active = false;
+            break;
+        }
+        furi_delay_ms(2);
+    }
+    return active;
 }
 
 static bool load_settings(MotorPulsesContext* ctx) {
@@ -365,6 +382,11 @@ int32_t ruleta_laser_app(void* p) {
         .pin = LASER_PIN_NUMBER,
     };
 
+    static const GpioPin home_switch_pin = {
+        .port = HOME_SWITCH_PIN_PORT,
+        .pin = HOME_SWITCH_PIN_NUMBER,
+    };
+
     // Inicializa el contexto con parámetros por defecto que luego podrán ajustarse desde el menú.
     MotorPulsesContext context = {
         .pin = &motor_pin,
@@ -388,6 +410,7 @@ int32_t ruleta_laser_app(void* p) {
     furi_hal_gpio_init_simple(&motor_pin, GpioModeOutputPushPull);
     furi_hal_gpio_init_simple(&direction_pin, GpioModeOutputPushPull);
     furi_hal_gpio_init_simple(&laser_pin, GpioModeOutputPushPull);
+    furi_hal_gpio_init_simple(&home_switch_pin, GpioModeInput);
     furi_hal_gpio_write(&motor_pin, false);
     furi_hal_gpio_write(&direction_pin, true);
     furi_hal_gpio_write(&laser_pin, false);
@@ -429,6 +452,8 @@ int32_t ruleta_laser_app(void* p) {
                     } else if(context.state == StateHelp) {
                         context.help_scroll_offset = 0;
                         context.state = StateConfig; // Volver al menú de configuración
+                    } else if(context.state == StateError) {
+                        context.state = StateConfig;
                     } else if(context.state == StateRunning) {
                         FURI_LOG_I("ruleta_laser", "Stopping execution");
                         if(timer_started) {
@@ -520,6 +545,15 @@ int32_t ruleta_laser_app(void* p) {
                     context.state == StateConfirm && event.input.key == InputKeyOk &&
                     event.input.type == InputTypeShort) {
                     FURI_LOG_I("ruleta_laser", "Starting motor pulse generator on PA7");
+
+                    if(home_switch_is_pressed(&home_switch_pin)) {
+                        FURI_LOG_E(
+                            "ruleta_laser",
+                            "Home switch already active at start; refusing to run");
+                        context.state = StateError;
+                        break;
+                    }
+
                     context.repetitions_remaining = context.total_repetitions;
                     context.state = StateRunning;
                     // Se inicia el timer usando el periodo configurado dinámicamente
@@ -533,16 +567,24 @@ int32_t ruleta_laser_app(void* p) {
                 context.current_pulse = 0;
                 view_port_update(view_port);
 
-                // Bucle principal de movimiento: primero avanza, luego retrocede, según la dirección activa.
-                for(uint32_t phase = 0; phase < 2; phase++) {
-                    bool direction_forward = (phase == 0);
-                    furi_hal_gpio_write(context.direction_pin, direction_forward);
+                bool home_found = false;
+                uint32_t max_search_steps = (context.motor_pulse_count * HOME_SWITCH_SEARCH_LIMIT_PERCENT) / 100u;
+                if(max_search_steps == 0) max_search_steps = context.motor_pulse_count;
 
-                    for(uint32_t i = 0; i < context.motor_pulse_count; i++) {
-                        context.current_pulse = (phase * context.motor_pulse_count) + i + 1;
+                if(context.state == StateRunning && home_switch_is_pressed(&home_switch_pin)) {
+                    home_found = true;
+                    FURI_LOG_I("ruleta_laser", "Home switch already pressed at start");
+                }
+
+                // Bucle principal de movimiento: primero avanza buscando el botón de referencia.
+                if(context.state == StateRunning && !home_found) {
+                    furi_hal_gpio_write(context.direction_pin, true);
+                    furi_hal_light_set(LightRed, 255);
+
+                    for(uint32_t step = 0; step < max_search_steps && context.state == StateRunning; step++) {
+                        context.current_pulse = step + 1;
                         view_port_update(view_port);
 
-                        // REVISIÓN DE BOTÓN DE EMERGENCIA INTERNA
                         AppEvent micro_event;
                         if(furi_message_queue_get(event_queue, &micro_event, 0) == FuriStatusOk) {
                             if(micro_event.type == EventTypeInput &&
@@ -557,12 +599,64 @@ int32_t ruleta_laser_app(void* p) {
                                 break;
                             }
                         }
+
+                        if(home_switch_is_pressed(&home_switch_pin)) {
+                            home_found = true;
+                            FURI_LOG_I("ruleta_laser", "Home switch triggered during forward move");
+                            break;
+                        }
+
+                        furi_hal_gpio_write(&motor_pin, true);
+                        furi_delay_us(context.motor_pulse_width_us);
+                        furi_hal_gpio_write(&motor_pin, false);
+                        furi_delay_us(context.motor_pulse_width_us);
                     }
 
-                    if(context.state != StateRunning) break;
+                    furi_hal_light_set(LightRed, 0);
 
+                    if(context.state == StateRunning && !home_found) {
+                        FURI_LOG_E(
+                            "ruleta_laser",
+                            "Home switch not found within %lu steps (%u%% of config)",
+                            max_search_steps,
+                            HOME_SWITCH_SEARCH_LIMIT_PERCENT);
+                        context.state = StateError;
+                        if(timer_started) {
+                            furi_timer_stop(timer);
+                            timer_started = false;
+                        }
+                    }
+                }
+
+                if(context.state == StateRunning && home_found) {
+                    furi_hal_gpio_write(context.direction_pin, false);
                     furi_hal_light_set(LightRed, 255);
-                    emit_pwm_pulse_block(context.motor_pulse_count, context.motor_pulse_width_us);
+
+                    for(uint32_t step = 0; step < context.motor_pulse_count && context.state == StateRunning; step++) {
+                        context.current_pulse = step + 1;
+                        view_port_update(view_port);
+
+                        AppEvent micro_event;
+                        if(furi_message_queue_get(event_queue, &micro_event, 0) == FuriStatusOk) {
+                            if(micro_event.type == EventTypeInput &&
+                               micro_event.input.key == InputKeyBack &&
+                               micro_event.input.type == InputTypeShort) {
+                                FURI_LOG_I("ruleta_laser", "Emergency stop triggered by user");
+                                context.state = StateConfig;
+                                if(timer_started) {
+                                    furi_timer_stop(timer);
+                                    timer_started = false;
+                                }
+                                break;
+                            }
+                        }
+
+                        furi_hal_gpio_write(&motor_pin, true);
+                        furi_delay_us(context.motor_pulse_width_us);
+                        furi_hal_gpio_write(&motor_pin, false);
+                        furi_delay_us(context.motor_pulse_width_us);
+                    }
+
                     furi_hal_light_set(LightRed, 0);
                 }
 
@@ -576,11 +670,11 @@ int32_t ruleta_laser_app(void* p) {
                 context.status_active = false;
                 context.current_pulse = 0;
 
-                if(context.repetitions_remaining > 0) {
+                if(context.state == StateRunning && context.repetitions_remaining > 0) {
                     context.repetitions_remaining--;
                 }
 
-                if(context.repetitions_remaining == 0) {
+                if(context.state == StateRunning && context.repetitions_remaining == 0) {
                     FURI_LOG_I("ruleta_laser", "Completed all configured repetitions");
                     if(timer_started) {
                         furi_timer_stop(timer);
