@@ -373,7 +373,7 @@ int32_t ruleta_laser_app(void* p) {
         .state = StateConfig, // Arranca en el menú de configuración
         .current_pulse = 0,
         .motor_pulse_count = 3300, // Por defecto 3300 pulsos por sentido
-        .motor_pulse_width_us = 100, // Ancho de pulso recomendado para el driver (100 us)
+        .motor_pulse_width_us = 300, // Ancho de pulso recomendado para el driver (100 us)
         .motor_pulse_period_ms = 3000, // Intervalo entre grupos de pulsos
         .total_repetitions = 1, // Por defecto 3 repeticiones
         .repetitions_remaining = 0,
