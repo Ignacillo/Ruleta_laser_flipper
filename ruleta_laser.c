@@ -1,4 +1,4 @@
-/* Sistema para avanzar la ruleta de placas laser mediante pulsos al PAP con Menú Interactivo */
+/* Sistema para avanzar la ruleta de placas laser mediante pulsos al PAP con Menú Interactivo 26-09-2026*/
 
 #include <furi.h>
 #include <furi_hal_gpio.h>
