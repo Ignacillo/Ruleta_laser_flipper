@@ -20,8 +20,8 @@
 #define DIRECTION_PIN_NUMBER LL_GPIO_PIN_6
 #define LASER_PIN_PORT GPIOA
 #define LASER_PIN_NUMBER LL_GPIO_PIN_4
-#define HOME_SWITCH_PIN_PORT GPIOA
-#define HOME_SWITCH_PIN_NUMBER LL_GPIO_PIN_5
+#define HOME_SWITCH_PIN_PORT GPIOB
+#define HOME_SWITCH_PIN_NUMBER LL_GPIO_PIN_3
 #define HOME_SWITCH_SEARCH_LIMIT_PERCENT 125u
 #define LASER_PULSE_MS 300
 
@@ -227,7 +227,7 @@ static void render_callback(Canvas* canvas, void* context) {
         canvas_draw_str(canvas, 2, 15, "ERROR");
 
         canvas_set_font(canvas, FontSecondary);
-        canvas_draw_str(canvas, 2, 35, "No se detecto HOME");
+        canvas_draw_str(canvas, 2, 35, "No se detecto el interruptor");
         canvas_draw_str(canvas, 2, 50, "Recorrido excedido");
         canvas_draw_str(canvas, 2, 62, "Atras: volver");
     }
@@ -295,20 +295,34 @@ static void motor_timer_callback(void* queue_context) {
     furi_message_queue_put(event_queue, &event, 0);
 }
 
+static bool home_switch_is_active(const GpioPin* pin) {
+    if(pin == NULL) return false;
+    return furi_hal_gpio_read(pin);
+}
+
 static bool home_switch_is_pressed(const GpioPin* pin) {
     if(pin == NULL) return false;
 
     // Botón NC con pull-up externo: en reposo está cerrado y vale LOW,
-    // cuando se pulsa/abre el circuito vale HIGH. Con debounce se evitan rebotes.
-    bool active = true;
-    for(uint8_t i = 0; i < 4; i++) {
-        if(furi_hal_gpio_read(pin) == false) {
-            active = false;
-            break;
-        }
-        furi_delay_ms(2);
-    }
-    return active;
+    // cuando se pulsa/abre el circuito vale HIGH. La comprobación se hace de forma
+    // ligera para no romper la frecuencia del PWM del motor.
+    if(!home_switch_is_active(pin)) return false;
+
+    furi_delay_ms(3);
+    return home_switch_is_active(pin);
+}
+
+static void emit_pwm_pulse_block(uint32_t pulse_count, uint32_t pulse_width_us) {
+    if(pulse_count == 0 || pulse_width_us == 0) return;
+
+    const uint32_t half_period_us = pulse_width_us;
+    const uint32_t block_duration_us = pulse_count * (half_period_us * 2);
+    uint32_t pwm_freq_hz = 1000000u / (half_period_us * 2);
+    if(pwm_freq_hz == 0) pwm_freq_hz = 1;
+
+    furi_hal_pwm_start(FuriHalPwmOutputIdTim1PA7, pwm_freq_hz, 50);
+    furi_delay_us(block_duration_us);
+    furi_hal_pwm_stop(FuriHalPwmOutputIdTim1PA7);
 }
 
 static bool load_settings(MotorPulsesContext* ctx) {
@@ -396,7 +410,7 @@ int32_t ruleta_laser_app(void* p) {
         .current_pulse = 0,
         .motor_pulse_count = 3300, // Por defecto 3300 pulsos por sentido
         .motor_pulse_width_us = 300, // Ancho de pulso recomendado para el driver (100 us)
-        .motor_pulse_period_ms = 3000, // Intervalo entre grupos de pulsos
+        .motor_pulse_period_ms = 20500, // Intervalo entre grupos de pulsos
         .total_repetitions = 1, // Por defecto 3 repeticiones
         .repetitions_remaining = 0,
         .selected_option = MenuPulsosCount,
@@ -576,14 +590,18 @@ int32_t ruleta_laser_app(void* p) {
                     FURI_LOG_I("ruleta_laser", "Home switch already pressed at start");
                 }
 
-                // Bucle principal de movimiento: primero avanza buscando el botón de referencia.
+                // Bucle principal de movimiento: primero avanza buscando el botón de referencia,
+                // manteniendo el mismo patrón PWM que antes para no perder velocidad.
                 if(context.state == StateRunning && !home_found) {
                     furi_hal_gpio_write(context.direction_pin, true);
                     furi_hal_light_set(LightRed, 255);
 
-                    for(uint32_t step = 0; step < max_search_steps && context.state == StateRunning; step++) {
-                        context.current_pulse = step + 1;
-                        view_port_update(view_port);
+                    const uint32_t check_every_steps = (context.motor_pulse_count > 200) ? 100u : 25u;
+                    uint32_t step_cursor = 0;
+
+                    while(step_cursor < max_search_steps && context.state == StateRunning) {
+                        uint32_t remaining = max_search_steps - step_cursor;
+                        uint32_t block_steps = (remaining > check_every_steps) ? check_every_steps : remaining;
 
                         AppEvent micro_event;
                         if(furi_message_queue_get(event_queue, &micro_event, 0) == FuriStatusOk) {
@@ -606,10 +624,10 @@ int32_t ruleta_laser_app(void* p) {
                             break;
                         }
 
-                        furi_hal_gpio_write(&motor_pin, true);
-                        furi_delay_us(context.motor_pulse_width_us);
-                        furi_hal_gpio_write(&motor_pin, false);
-                        furi_delay_us(context.motor_pulse_width_us);
+                        context.current_pulse = step_cursor + block_steps;
+                        view_port_update(view_port);
+                        emit_pwm_pulse_block(block_steps, context.motor_pulse_width_us);
+                        step_cursor += block_steps;
                     }
 
                     furi_hal_light_set(LightRed, 0);
@@ -632,9 +650,10 @@ int32_t ruleta_laser_app(void* p) {
                     furi_hal_gpio_write(context.direction_pin, false);
                     furi_hal_light_set(LightRed, 255);
 
-                    for(uint32_t step = 0; step < context.motor_pulse_count && context.state == StateRunning; step++) {
-                        context.current_pulse = step + 1;
-                        view_port_update(view_port);
+                    uint32_t step_cursor = 0;
+                    while(step_cursor < context.motor_pulse_count && context.state == StateRunning) {
+                        uint32_t remaining = context.motor_pulse_count - step_cursor;
+                        uint32_t block_steps = (remaining > 100u) ? 100u : remaining;
 
                         AppEvent micro_event;
                         if(furi_message_queue_get(event_queue, &micro_event, 0) == FuriStatusOk) {
@@ -651,10 +670,10 @@ int32_t ruleta_laser_app(void* p) {
                             }
                         }
 
-                        furi_hal_gpio_write(&motor_pin, true);
-                        furi_delay_us(context.motor_pulse_width_us);
-                        furi_hal_gpio_write(&motor_pin, false);
-                        furi_delay_us(context.motor_pulse_width_us);
+                        context.current_pulse = step_cursor + block_steps;
+                        view_port_update(view_port);
+                        emit_pwm_pulse_block(block_steps, context.motor_pulse_width_us);
+                        step_cursor += block_steps;
                     }
 
                     furi_hal_light_set(LightRed, 0);
