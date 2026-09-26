@@ -300,11 +300,6 @@ static void motor_timer_callback(void* queue_context) {
     furi_message_queue_put(event_queue, &event, 0);
 }
 
-static bool home_switch_is_active(const GpioPin* pin) {
-    if(pin == NULL) return false;
-    return furi_hal_gpio_read(pin);
-}
-
 static void home_switch_isr(void* ctx) {
     MotorPulsesContext* app_ctx = ctx;
     if(app_ctx == NULL) return;
@@ -669,51 +664,26 @@ int32_t ruleta_laser_app(void* p) {
                 uint32_t max_search_steps = (context.motor_pulse_count * HOME_SWITCH_SEARCH_LIMIT_PERCENT) / 100u;
                 if(max_search_steps == 0) max_search_steps = context.motor_pulse_count;
 
-                if(context.state == StateRunning && home_switch_is_pressed(&home_switch_pin)) {
+                if(context.state == StateRunning && furi_hal_gpio_read(&home_switch_pin)) {
                     home_found = true;
                     FURI_LOG_I("ruleta_laser", "Home switch already pressed at start");
                 }
 
                 // Bucle principal de movimiento: primero avanza buscando el botón de referencia,
-                // manteniendo el mismo patrón PWM que antes para no perder velocidad.
+                // confiando en la interrupción para detener el movimiento a la altura exacta.
                 if(context.state == StateRunning && !home_found) {
                     furi_hal_gpio_write(context.direction_pin, true);
                     furi_hal_light_set(LightRed, 255);
 
-                    // Reducimos el tamaño de cada bloque para que el avance no parezca
-                    // en paquetes grandes ni deje restos aleatorios al detectar el home.
-                    const uint32_t check_every_steps = (context.motor_pulse_count > 200) ? 25u : 10u;
-                    uint32_t step_cursor = 0;
+                    arm_home_interrupt(&home_switch_pin, &context);
+                    emit_pwm_pulse_block(
+                        max_search_steps,
+                        context.motor_pulse_width_us,
+                        &context.home_triggered);
 
-                    while(step_cursor < max_search_steps && context.state == StateRunning) {
-                        uint32_t remaining = max_search_steps - step_cursor;
-                        uint32_t block_steps = (remaining > check_every_steps) ? check_every_steps : remaining;
-
-                        AppEvent micro_event;
-                        if(furi_message_queue_get(event_queue, &micro_event, 0) == FuriStatusOk) {
-                            if(micro_event.type == EventTypeInput &&
-                               micro_event.input.key == InputKeyBack &&
-                               micro_event.input.type == InputTypeShort) {
-                                FURI_LOG_I("ruleta_laser", "Emergency stop triggered by user");
-                                context.state = StateConfig;
-                                if(timer_started) {
-                                    furi_timer_stop(timer);
-                                    timer_started = false;
-                                }
-                                break;
-                            }
-                        }
-
-                        if(home_switch_is_pressed(&home_switch_pin)) {
-                            home_found = true;
-                            FURI_LOG_I("ruleta_laser", "Home switch triggered during forward move");
-                            break;
-                        }
-
-                        context.current_pulse = step_cursor + block_steps;
-                        view_port_update(view_port);
-                        emit_pwm_pulse_block(block_steps, context.motor_pulse_width_us);
-                        step_cursor += block_steps;
+                    if(home_switch_confirmed(&context, &home_switch_pin)) {
+                        home_found = true;
+                        FURI_LOG_I("ruleta_laser", "Home switch triggered during forward move");
                     }
 
                     furi_hal_light_set(LightRed, 0);
@@ -737,31 +707,12 @@ int32_t ruleta_laser_app(void* p) {
                     furi_hal_gpio_write(context.direction_pin, false);
                     furi_hal_light_set(LightRed, 255);
 
-                    uint32_t step_cursor = 0;
-                    while(step_cursor < context.motor_pulse_count && context.state == StateRunning) {
-                        uint32_t remaining = context.motor_pulse_count - step_cursor;
-                        uint32_t block_steps = (remaining > 10u) ? 10u : remaining;
-
-                        AppEvent micro_event;
-                        if(furi_message_queue_get(event_queue, &micro_event, 0) == FuriStatusOk) {
-                            if(micro_event.type == EventTypeInput &&
-                               micro_event.input.key == InputKeyBack &&
-                               micro_event.input.type == InputTypeShort) {
-                                FURI_LOG_I("ruleta_laser", "Emergency stop triggered by user");
-                                context.state = StateConfig;
-                                if(timer_started) {
-                                    furi_timer_stop(timer);
-                                    timer_started = false;
-                                }
-                                break;
-                            }
-                        }
-
-                        context.current_pulse = step_cursor + block_steps;
-                        view_port_update(view_port);
-                        emit_pwm_pulse_block(block_steps, context.motor_pulse_width_us);
-                        step_cursor += block_steps;
-                    }
+                    // En el tramo de retorno volvemos a usar avance libre, sin fraccionar en bloques.
+                    arm_home_interrupt(&home_switch_pin, &context);
+                    emit_pwm_pulse_block(
+                        context.motor_pulse_count,
+                        context.motor_pulse_width_us,
+                        &context.home_triggered);
 
                     furi_hal_light_set(LightRed, 0);
                 }
