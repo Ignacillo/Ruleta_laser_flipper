@@ -23,7 +23,6 @@
 #define HOME_SWITCH_PIN_PORT GPIOB
 #define HOME_SWITCH_PIN_NUMBER LL_GPIO_PIN_3
 #define HOME_SWITCH_SEARCH_LIMIT_PERCENT 125u
-#define HOME_SWITCH_DEBOUNCE_MS 3u
 #define LASER_PULSE_MS 300
 
 #define SETTINGS_FILE_PATH "/int/ruleta_laser_settings.bin"
@@ -60,9 +59,6 @@ typedef struct {
     uint32_t motor_pulse_width_us; // Ancho de cada pulso en microsegundos (valor que interpreta el driver)
     uint32_t total_repetitions; // Número total de repeticiones del ciclo completo
     uint32_t repetitions_remaining; // Repeticiones que quedan por ejecutar
-
-    volatile bool home_triggered; // Señala que la interrupción del home ha disparado
-    volatile uint32_t home_trigger_tick; // Tick exacto en que se disparó la interrupción
 
     MenuOption selected_option; // Opción actualmente resaltada en el menú
     uint8_t help_scroll_offset; // Desplazamiento vertical de la pantalla de ayuda
@@ -300,74 +296,7 @@ static void motor_timer_callback(void* queue_context) {
     furi_message_queue_put(event_queue, &event, 0);
 }
 
-static void home_switch_isr(void* ctx) {
-    MotorPulsesContext* app_ctx = ctx;
-    if(app_ctx == NULL) return;
-
-    // El interruptor de home se activa por flanco de subida: LOW -> HIGH.
-    // En ese instante cortamos el PWM sin hacer delays ni polling bloqueante.
-    if(app_ctx->state != StateRunning) return;
-    if(app_ctx->home_triggered) return;
-
-    furi_hal_pwm_stop(FuriHalPwmOutputIdTim1PA7);
-    app_ctx->home_triggered = true;
-    app_ctx->home_trigger_tick = furi_get_tick();
-
-    FURI_LOG_I("ruleta_laser", "Home switch interrupt fired");
-}
-
-static void arm_home_interrupt(const GpioPin* pin, MotorPulsesContext* ctx) {
-    if(pin == NULL || ctx == NULL) return;
-
-    // Desarmamos cualquier configuración previa para no dejar callbacks colgando.
-    furi_hal_gpio_disable_int_callback(pin);
-    furi_hal_gpio_remove_int_callback(pin);
-
-    ctx->home_triggered = false;
-    ctx->home_trigger_tick = 0;
-
-    // El switch es NC con pull-up externo, así que el flanco útil es el de subida.
-    furi_hal_gpio_init_ex(
-        pin,
-        GpioModeInterruptRise,
-        GpioPullNo,
-        GpioSpeedVeryHigh,
-        GpioAltFnUnused);
-
-    furi_hal_gpio_add_int_callback(pin, home_switch_isr, ctx);
-    furi_hal_gpio_enable_int_callback(pin);
-}
-
-static void disable_home_interrupt(const GpioPin* pin) {
-    if(pin == NULL) return;
-
-    furi_hal_gpio_disable_int_callback(pin);
-    furi_hal_gpio_remove_int_callback(pin);
-}
-
-static bool home_switch_confirmed(MotorPulsesContext* ctx, const GpioPin* pin) {
-    if(ctx == NULL || pin == NULL) return false;
-    if(!ctx->home_triggered) return false;
-
-    uint32_t elapsed_ms = furi_get_tick() - ctx->home_trigger_tick;
-    if(elapsed_ms < HOME_SWITCH_DEBOUNCE_MS) {
-        return false;
-    }
-
-    // Debounce no bloqueante: confirmamos el home solo si sigue en HIGH.
-    if(!furi_hal_gpio_read(pin)) {
-        ctx->home_triggered = false;
-        return false;
-    }
-
-    ctx->home_triggered = false;
-    return true;
-}
-
-static void emit_pwm_pulse_block(
-    uint32_t pulse_count,
-    uint32_t pulse_width_us,
-    volatile bool* home_triggered) {
+static void emit_pwm_pulse_block(uint32_t pulse_count, uint32_t pulse_width_us) {
     if(pulse_count == 0 || pulse_width_us == 0) return;
 
     const uint32_t half_period_us = pulse_width_us;
@@ -375,21 +304,51 @@ static void emit_pwm_pulse_block(
     uint32_t pwm_freq_hz = 1000000u / (half_period_us * 2);
     if(pwm_freq_hz == 0) pwm_freq_hz = 1;
 
-    // El avance ya no se trocea por polling; la interrupción del home corta el PWM
-    // en el instante exacto de activación del sensor.
+    furi_hal_pwm_start(FuriHalPwmOutputIdTim1PA7, pwm_freq_hz, 50);
+    furi_delay_us(block_duration_us);
+    furi_hal_pwm_stop(FuriHalPwmOutputIdTim1PA7);
+}
+
+static bool run_motor_with_home_check(uint32_t pulse_count, uint32_t pulse_width_us, const GpioPin* home_pin) {
+    if(pulse_count == 0 || pulse_width_us == 0 || home_pin == NULL) return false;
+
+    // Polling activo no bloqueante: mientras el PWM está corriendo, vemos el estado del
+    // home prácticamente en continuo con lecturas cortas. Este enfoque evita la
+    // interferencia de la interrupción EXTI y permite detener el motor sin trocear el
+    // movimiento en bloques de N pasos.
+    const uint32_t half_period_us = pulse_width_us;
+    const uint32_t total_duration_us = pulse_count * (half_period_us * 2);
+    uint32_t pwm_freq_hz = 1000000u / (half_period_us * 2);
+    if(pwm_freq_hz == 0) pwm_freq_hz = 1;
+
     furi_hal_pwm_start(FuriHalPwmOutputIdTim1PA7, pwm_freq_hz, 50);
 
     uint32_t elapsed_us = 0;
-    while(elapsed_us < block_duration_us) {
-        if(home_triggered != NULL && *home_triggered) {
-            break;
+    uint8_t stable_high_count = 0;
+    bool home_detected = false;
+
+    while(elapsed_us < total_duration_us) {
+        if(furi_hal_gpio_read(home_pin)) {
+            stable_high_count++;
+            if(stable_high_count >= 4u) {
+                home_detected = true;
+                break;
+            }
+        } else {
+            stable_high_count = 0;
         }
 
-        furi_delay_us(50);
-        elapsed_us += 50;
+        uint32_t step_us = 50u;
+        if((total_duration_us - elapsed_us) < step_us) {
+            step_us = total_duration_us - elapsed_us;
+        }
+
+        furi_delay_us(step_us);
+        elapsed_us += step_us;
     }
 
     furi_hal_pwm_stop(FuriHalPwmOutputIdTim1PA7);
+    return home_detected;
 }
 
 static bool load_settings(MotorPulsesContext* ctx) {
@@ -481,8 +440,6 @@ int32_t ruleta_laser_app(void* p) {
         .motor_pulse_period_ms = 20500, // Intervalo entre grupos de pulsos
         .total_repetitions = 1, // Por defecto 3 repeticiones
         .repetitions_remaining = 0,
-        .home_triggered = false,
-        .home_trigger_tick = 0,
         .selected_option = MenuPulsosCount,
         .help_scroll_offset = 0,
         .config_scroll_offset = 0,
@@ -490,18 +447,13 @@ int32_t ruleta_laser_app(void* p) {
 
     load_settings(&context);
 
-    // Configura los pines como salidas digitales y deja el sensor de home listo para EXTI.
+    // Configura los pines como salidas digitales y el sensor de home como entrada
+    // normal sin EXTI. El pull-up externo real fija el reposo LOW y el estado HIGH
+    // solo se activa cuando el switch se abre.
     furi_hal_gpio_init_simple(&motor_pin, GpioModeOutputPushPull);
     furi_hal_gpio_init_simple(&direction_pin, GpioModeOutputPushPull);
     furi_hal_gpio_init_simple(&laser_pin, GpioModeOutputPushPull);
-    furi_hal_gpio_init_ex(
-        &home_switch_pin,
-        GpioModeInterruptRise,
-        GpioPullNo,
-        GpioSpeedVeryHigh,
-        GpioAltFnUnused);
-    furi_hal_gpio_add_int_callback(&home_switch_pin, home_switch_isr, &context);
-    furi_hal_gpio_enable_int_callback(&home_switch_pin);
+    furi_hal_gpio_init_simple(&home_switch_pin, GpioModeInput);
     furi_hal_gpio_write(&motor_pin, false);
     furi_hal_gpio_write(&direction_pin, true);
     furi_hal_gpio_write(&laser_pin, false);
@@ -646,8 +598,6 @@ int32_t ruleta_laser_app(void* p) {
                     }
 
                     context.repetitions_remaining = context.total_repetitions;
-                    context.home_triggered = false;
-                    context.home_trigger_tick = 0;
                     context.state = StateRunning;
                     // Se inicia el timer usando el periodo configurado dinámicamente
                     furi_timer_start(timer, furi_ms_to_ticks(context.motor_pulse_period_ms));
@@ -669,22 +619,18 @@ int32_t ruleta_laser_app(void* p) {
                     FURI_LOG_I("ruleta_laser", "Home switch already pressed at start");
                 }
 
-                // Bucle principal de movimiento: primero avanza buscando el botón de referencia,
-                // confiando en la interrupción para detener el movimiento a la altura exacta.
+                // Bucle principal de movimiento: primero avanzamos buscando el home con
+                // polling activo mientras el PWM está corriendo, sin dividir el avance en
+                // bloques de N pasos. Si el pin se mantiene en HIGH durante varias lecturas,
+                // detenemos el motor en ese instante.
                 if(context.state == StateRunning && !home_found) {
                     furi_hal_gpio_write(context.direction_pin, true);
                     furi_hal_light_set(LightRed, 255);
 
-                    arm_home_interrupt(&home_switch_pin, &context);
-                    emit_pwm_pulse_block(
+                    home_found = run_motor_with_home_check(
                         max_search_steps,
                         context.motor_pulse_width_us,
-                        &context.home_triggered);
-
-                    if(home_switch_confirmed(&context, &home_switch_pin)) {
-                        home_found = true;
-                        FURI_LOG_I("ruleta_laser", "Home switch triggered during forward move");
-                    }
+                        &home_switch_pin);
 
                     furi_hal_light_set(LightRed, 0);
 
@@ -694,7 +640,6 @@ int32_t ruleta_laser_app(void* p) {
                             "Home switch not found within %lu steps (%u%% of config)",
                             max_search_steps,
                             HOME_SWITCH_SEARCH_LIMIT_PERCENT);
-                        disable_home_interrupt(&home_switch_pin);
                         context.state = StateError;
                         if(timer_started) {
                             furi_timer_stop(timer);
@@ -707,13 +652,9 @@ int32_t ruleta_laser_app(void* p) {
                     furi_hal_gpio_write(context.direction_pin, false);
                     furi_hal_light_set(LightRed, 255);
 
-                    // En el tramo de retorno volvemos a usar avance libre, sin fraccionar en bloques.
-                    arm_home_interrupt(&home_switch_pin, &context);
-                    emit_pwm_pulse_block(
-                        context.motor_pulse_count,
-                        context.motor_pulse_width_us,
-                        &context.home_triggered);
-
+                    // En el tramo de retorno se vuelve a mover el motor completo, sin
+                    // comprobar el home, igual que en el flujo original.
+                    emit_pwm_pulse_block(context.motor_pulse_count, context.motor_pulse_width_us);
                     furi_hal_light_set(LightRed, 0);
                 }
 
@@ -754,7 +695,6 @@ int32_t ruleta_laser_app(void* p) {
     }
     furi_timer_free(timer);
 
-    disable_home_interrupt(&home_switch_pin);
     furi_hal_gpio_write(&motor_pin, false);
     furi_hal_gpio_write(&direction_pin, true);
     furi_hal_gpio_write(&laser_pin, false);
